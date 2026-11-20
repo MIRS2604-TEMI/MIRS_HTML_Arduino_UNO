@@ -25,7 +25,7 @@
  *   リミット到達（開路）      : ピン = HIGH（内蔵プルアップ）
  *
  * ■ 動作フロー
- *   IDLE →[ボタン押下]→ RISING →[SwA反応]→ WAITING(2秒) →[経過]→ LOWERING →[SwB反応]→ IDLE
+ *   IDLE →[ボタン押下]→ RISING →[SwA反応]→ WAITING(2秒) →[経過]→ LOWERING →[SwB反応後500ms]→ IDLE
  *   ・IDLE状態でのボタン押下: 確定で上昇（RISING）を開始
  *   ・動作中（RISING / WAITING / LOWERING）のボタン押下: 即時停止して一時停止（PAUSED）
  *   ・PAUSED状態でのボタン押下: 直前に実行していたモード（RISING / WAITING / LOWERING）を再開
@@ -59,10 +59,11 @@ const uint8_t pin_LED = 13;   // インジケータ LED
 // ============================================================
 //  動作パラメータ（調整用）
 // ============================================================
-const uint8_t MOTOR_SPEED = 150; // モータ速度（0〜255）
-const uint32_t WAIT_MS = 2000;   // 上昇停止後の待機時間 [ms]
-const uint32_t DEBOUNCE_MS = 50; // ボタンのチャタリング除去時間 [ms]
-const bool DIR_UP = false;       // 上昇方向のDIR値（逆なら false）
+const uint8_t MOTOR_SPEED = 150;            // モータ速度（0〜255）
+const uint32_t WAIT_MS = 2000;              // 上昇停止後の待機時間 [ms]
+const uint32_t LOWER_LIMIT_RUN_ON_MS = 200; // 下限到達後にモータを回し続ける時間 [ms]
+const uint32_t DEBOUNCE_MS = 50;            // ボタンのチャタリング除去時間 [ms]
+const bool DIR_UP = false;                  // 上昇方向のDIR値（逆なら false）
 
 // ============================================================
 //  状態定義
@@ -70,17 +71,20 @@ const bool DIR_UP = false;       // 上昇方向のDIR値（逆なら false）
 // ============================================================
 enum State
 {
-    ST_IDLE,    // 待機中（ボタン入力受付、LED消灯）
-    ST_RISING,  // 上昇中（SwA 待ち、LED点灯）
-    ST_WAITING, // 上昇完了後の一時停止（2秒待機、LED点灯）
-    ST_LOWERING,// 下降中（SwB 待ち、LED点灯）
-    ST_PAUSED   // 一時停止中（ボタン再押下待ち）
+    ST_IDLE,     // 待機中（ボタン入力受付、LED消灯）
+    ST_RISING,   // 上昇中（SwA 待ち、LED点灯）
+    ST_WAITING,  // 上昇完了後の一時停止（2秒待機、LED点灯）
+    ST_LOWERING, // 下降中（SwB 待ち、LED点灯）
+    ST_PAUSED    // 一時停止中（ボタン再押下待ち）
 };
 
 State state = ST_IDLE;
-State pausedState = ST_IDLE; // 一時停止直前の状態
-uint32_t waitStart = 0;      // WAITING 開始時刻
-uint32_t waitElapsed = 0;    // WAITING 一時停止時の経過時間
+State pausedState = ST_IDLE;    // 一時停止直前の状態
+uint32_t waitStart = 0;         // WAITING 開始時刻
+uint32_t waitElapsed = 0;       // WAITING 一時停止時の経過時間
+uint32_t lowerLimitStart = 0;   // 下限到達後のモータ継続開始時刻
+uint32_t lowerLimitElapsed = 0; // LOWERING 一時停止時の継続時間
+bool lowerLimitReached = false; // 下限スイッチ検知済み
 
 // ============================================================
 //  ヘルパー関数
@@ -273,10 +277,14 @@ void loop()
             {
                 waitElapsed = millis() - waitStart; // 経過時間を保持
             }
+            else if (state == ST_LOWERING && lowerLimitReached)
+            {
+                lowerLimitElapsed = millis() - lowerLimitStart;
+            }
             state = ST_PAUSED;
             Serial.print(F("-> PAUSED (interrupted "));
-            Serial.print(pausedState == ST_RISING ? F("RISING") :
-                         pausedState == ST_WAITING ? F("WAITING") : F("LOWERING"));
+            Serial.print(pausedState == ST_RISING ? F("RISING") : pausedState == ST_WAITING ? F("WAITING")
+                                                                                            : F("LOWERING"));
             Serial.println(F(")"));
             break;
 
@@ -301,16 +309,25 @@ void loop()
             }
             else if (pausedState == ST_LOWERING)
             {
-                if (isAtLimit(pin_SW_B))
+                if (!lowerLimitReached && isAtLimit(pin_SW_B))
                 {
-                    // 既に下端に到達しているなら完了としてIDLEへ
+                    lowerLimitReached = true;
+                    lowerLimitElapsed = 0;
+                }
+
+                if (lowerLimitReached && lowerLimitElapsed >= LOWER_LIMIT_RUN_ON_MS)
+                {
                     motorStop();
                     digitalWrite(pin_LED, HIGH);
                     state = ST_IDLE;
-                    Serial.println(F("Resume -> IDLE (Already at bottom)"));
+                    lowerLimitReached = false;
+                    lowerLimitElapsed = 0;
+                    Serial.println(F("Resume -> IDLE (Bottom reached)"));
                 }
                 else
                 {
+                    if (lowerLimitReached)
+                        lowerLimitStart = millis() - lowerLimitElapsed;
                     state = ST_LOWERING;
                     digitalWrite(pin_LED, LOW);
                     motorDrive(!DIR_UP, MOTOR_SPEED);
@@ -366,13 +383,28 @@ void loop()
         break;
 
     case ST_LOWERING:
-        // SwB が反応したら停止して IDLE に戻る。
-        if (!isAtLimit(pin_SW_B))
+        // SwB が反応してから LOWER_LIMIT_RUN_ON_MS 経過後に停止する。
+        if (!lowerLimitReached)
+        {
+            if (!isAtLimit(pin_SW_B))
+                break;
+
+            lowerLimitReached = true;
+            lowerLimitStart = millis();
+            lowerLimitElapsed = 0;
+            Serial.print(F("SwB reached; continuing motor for "));
+            Serial.print(LOWER_LIMIT_RUN_ON_MS);
+            Serial.println(F("ms"));
+        }
+
+        if ((millis() - lowerLimitStart) < LOWER_LIMIT_RUN_ON_MS)
             break;
 
         motorStop();
         digitalWrite(pin_LED, HIGH);
         state = ST_IDLE;
+        lowerLimitReached = false;
+        lowerLimitElapsed = 0;
         Serial.println(F("-> IDLE"));
         break;
     }
